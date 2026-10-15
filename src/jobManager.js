@@ -1,3 +1,4 @@
+
 import crypto from 'node:crypto';
 import fs from 'node:fs/promises';
 import path from 'node:path';
@@ -6,29 +7,14 @@ import { log } from './logger.js';
 import { runCodeAnalyzer } from './analyzer.js';
 import { postCallback, toApexDatetime } from './callbackClient.js';
 import { parseAnalyzerResults } from './resultParser.js';
-import {
-  fetchApexClasses,
-  uploadReportContentVersion
-} from './salesforceClient.js';
 
 const jobs = new Map();
 let activeJobs = 0;
 const waitQueue = [];
 
-/**
- * @typedef {object} WorkerStartRequest
- * @property {string} scanId
- * @property {string} scanNumber
- * @property {string} scanType
- * @property {string} environment
- * @property {string} requestHash
- * @property {string} correlationId
- * @property {string[]} apexClassIds
- * @property {string} callbackEndpoint
- */
-
 export function createJob(startRequest) {
   const jobId = crypto.randomUUID();
+
   const job = {
     id: jobId,
     request: startRequest,
@@ -37,6 +23,7 @@ export function createJob(startRequest) {
     analyzerChild: null,
     createdAt: new Date()
   };
+
   jobs.set(jobId, job);
   enqueueJob(job);
   return job;
@@ -48,13 +35,15 @@ export function getJob(jobId) {
 
 export function cancelJob(jobId) {
   const job = jobs.get(jobId);
-  if (!job) {
-    return false;
-  }
+
+  if (!job) return false;
+
   job.cancelRequested = true;
+
   if (job.analyzerChild) {
     job.analyzerChild.kill('SIGKILL');
   }
+
   job.status = 'CANCELLED';
   return true;
 }
@@ -62,26 +51,30 @@ export function cancelJob(jobId) {
 function enqueueJob(job) {
   if (activeJobs < config.maxConcurrentJobs) {
     activeJobs += 1;
+
     runJob(job)
       .catch((err) => {
-        log.error('Unhandled job failure', { jobId: job.id, error: err.message });
+        log.error('Unhandled job failure', {
+          jobId: job.id,
+          error: err.message
+        });
       })
       .finally(() => {
         activeJobs -= 1;
+
         const next = waitQueue.shift();
-        if (next) {
-          enqueueJob(next);
-        }
+        if (next) enqueueJob(next);
       });
+
     return;
   }
+
   waitQueue.push(job);
 }
 
 async function runJob(job) {
   const { request } = job;
   const startedDate = new Date();
-  job.status = 'RETRIEVING_SOURCE';
 
   const workDir = path.join(
     config.jobWorkRoot,
@@ -89,8 +82,10 @@ async function runJob(job) {
   );
 
   try {
+    job.status = 'VALIDATING_SOURCE';
+
     await safeCallback(job, {
-      status: 'RETRIEVING_SOURCE',
+      status: 'VALIDATING_SOURCE',
       startedDate: toApexDatetime(startedDate)
     });
 
@@ -99,9 +94,35 @@ async function runJob(job) {
       return;
     }
 
-    const apexClasses = await fetchApexClasses(request.apexClassIds || []);
+    const classes = request.classes;
+
+    if (!Array.isArray(classes) || classes.length === 0) {
+      throw new Error(
+        'No Apex source provided. Supply a non-empty classes array.'
+      );
+    }
+
+    for (const apexClass of classes) {
+      if (
+        !apexClass ||
+        typeof apexClass.name !== 'string' ||
+        !/^[A-Za-z][A-Za-z0-9_]*$/.test(apexClass.name) ||
+        typeof apexClass.source !== 'string'
+      ) {
+        throw new Error(
+          'Each class must contain a valid name and source string.'
+        );
+      }
+    }
+
     const classByFileName = new Map(
-      apexClasses.map((c) => [`${c.name}.cls`, { id: c.id, name: c.name }])
+      classes.map((apexClass) => [
+        `${apexClass.name}.cls`,
+        {
+          id: apexClass.id || apexClass.name,
+          name: apexClass.name
+        }
+      ])
     );
 
     job.status = 'SCANNING';
@@ -114,42 +135,47 @@ async function runJob(job) {
 
     const { report } = await runCodeAnalyzer({
       workspaceDir: path.join(workDir, 'workspace'),
-      classes: apexClasses,
+      classes: classes.map((apexClass) => ({
+        id: apexClass.id || apexClass.name,
+        name: apexClass.name,
+        body: apexClass.source
+      })),
       onSpawn: (child) => {
         job.analyzerChild = child;
       }
     });
+
     job.analyzerChild = null;
+
+    if (job.cancelRequested) {
+      await finishCancelled(job, startedDate);
+      return;
+    }
 
     job.status = 'PARSING_RESULTS';
     await safeCallback(job, { status: 'PARSING_RESULTS' });
 
     const parsed = parseAnalyzerResults(report, classByFileName);
-    const filesRequested = apexClasses.length;
+
+    const filesRequested = classes.length;
     const filesScanned = parsed.files.filter(
-      (f) => f.scanStatus === 'SCANNED'
+      (file) => file.scanStatus === 'SCANNED'
     ).length;
-    const hadFileFailures = parsed.files.some((f) => f.scanStatus === 'FAILED');
 
-    job.status = 'GENERATING_REPORT';
-    await safeCallback(job, { status: 'GENERATING_REPORT' });
-
-    const reportJson = JSON.stringify(report, null, 2);
-    const reportTitle = `PMD Scan ${request.scanNumber || job.id}`;
-    const reportFileName = `${reportTitle.replace(/[^\w.-]+/g, '_')}.json`;
-
-    job.status = 'UPLOADING_REPORT';
-    await safeCallback(job, { status: 'UPLOADING_REPORT' });
-
-    const contentVersionId = await uploadReportContentVersion({
-      title: reportTitle,
-      pathOnClient: reportFileName,
-      versionDataBase64: Buffer.from(reportJson, 'utf8').toString('base64')
-    });
+    const hadFileFailures = parsed.files.some(
+      (file) => file.scanStatus === 'FAILED'
+    );
 
     const terminalStatus = hadFileFailures
       ? 'COMPLETED_WITH_WARNINGS'
       : 'COMPLETED';
+
+    job.status = 'GENERATING_REPORT';
+    await safeCallback(job, { status: 'GENERATING_REPORT' });
+
+    // Return report data through the callback instead of uploading
+    // it to Salesforce Files.
+    const reportJson = JSON.stringify(report);
 
     await safeCallback(job, {
       status: terminalStatus,
@@ -165,14 +191,27 @@ async function runJob(job) {
       infoCount: parsed.severityCounts.INFO,
       analyzerVersion: parsed.analyzerVersion,
       rulesetVersion: parsed.rulesetVersion || config.rulesetVersion,
-      reportContentVersionId: contentVersionId,
+      report,
+      reportJson,
       files: parsed.files
     });
 
     job.status = terminalStatus;
+
+    log.info('Scan job completed', {
+      jobId: job.id,
+      status: terminalStatus,
+      filesScanned,
+      totalViolations: parsed.totalViolations
+    });
   } catch (error) {
     job.status = 'FAILED';
-    log.error('Scan job failed', { jobId: job.id, error: error.message });
+
+    log.error('Scan job failed', {
+      jobId: job.id,
+      error: error.message
+    });
+
     await safeCallback(job, {
       status: 'FAILED',
       startedDate: toApexDatetime(startedDate),
@@ -208,7 +247,12 @@ async function safeCallback(job, partial) {
       status: partial.status,
       error: error.message
     });
-    if (partial.status === 'FAILED' || partial.status === 'COMPLETED') {
+
+    if (
+      ['FAILED', 'COMPLETED', 'COMPLETED_WITH_WARNINGS'].includes(
+        partial.status
+      )
+    ) {
       throw error;
     }
   }
