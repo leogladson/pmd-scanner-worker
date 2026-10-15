@@ -1,0 +1,6 @@
+# Minimal Code Analyzer config for the PMD scanner worker (PMD engine only).
+# Extend this file to add custom PMD rulesets aligned with your org standards.
+
+engines:
+  pmd:
+    disable_engine: false

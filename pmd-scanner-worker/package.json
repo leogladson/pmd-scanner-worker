@@ -1,0 +1,19 @@
+{
+  "name": "@daikin/pmd-scanner-worker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "External worker for the Apex PMD Scanner (Salesforce Code Analyzer CLI + callback API).",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "jsforce": "^3.6.3"
+  }
+}
